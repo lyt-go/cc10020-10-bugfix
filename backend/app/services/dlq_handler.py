@@ -31,10 +31,13 @@ class DlqHandlerService(BaseModuleService):
         self._replay_history: list[dict[str, Any]] = []
 
     def enqueue_dead_letter(self, source_queue: str, original_message: str,
-                            failure_reason: str, consumer_id: int = 0) -> dict[str, Any]:
+                            failure_reason: str, consumer_id: int = 0,
+                            offset: int | None = None) -> dict[str, Any]:
         """将消费失败的消息加入死信队列。
 
         自动生成记录编号、消息指纹、入队时间戳和失败原因分类。
+        登记时关联来源消费偏移，并返回登记凭证（记录编号 + 死信ID），
+        供消息队列消费侧回写消费偏移确认明细。
         """
         existing = json_store.get_all(self.MODULE)
         max_id = max((int(e.get("id", 0)) for e in existing), default=0)
@@ -54,6 +57,8 @@ class DlqHandlerService(BaseModuleService):
                 "ok": True,
                 "message": f"消息已在死信队列中（retry#{retry_count}），合并为已有记录 #{existing_dlq['id']}",
                 "dlq_id": existing_dlq["id"],
+                "record_no": existing_dlq.get("记录编号", ""),
+                "offset": existing_dlq.get("_offset", offset),
                 "is_duplicate": True,
             }
 
@@ -75,6 +80,7 @@ class DlqHandlerService(BaseModuleService):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "_fingerprint": msg_fingerprint,
             "_consumer_id": consumer_id,
+            "_offset": offset,
         }
 
         # 填充LIST_FIELDS中的其他字段
@@ -90,8 +96,15 @@ class DlqHandlerService(BaseModuleService):
                     dlq_entry.get("重放批次", "") if field == "重放批次" else ""
                 )
 
-        json_store.insert(self.MODULE, dlq_entry)
-        return {"ok": True, "message": f"死信已入队，编号 {record_no}", "dlq_id": dlq_entry["id"], "is_duplicate": False}
+        inserted = json_store.insert(self.MODULE, dlq_entry)
+        return {
+            "ok": True,
+            "message": f"死信已入队，编号 {record_no}",
+            "dlq_id": inserted["id"],
+            "record_no": record_no,
+            "offset": offset,
+            "is_duplicate": False,
+        }
 
     def analyze_failure_reasons(self) -> dict[str, Any]:
         """分析所有死信记录的失败原因分布，提供分类统计和主要问题识别。"""

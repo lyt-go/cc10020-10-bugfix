@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.persistence import JsonStore, json_store as global_store
+from app.persistence import JsonStore
 from app.services.api_endpoint import ApiEndpointService
 from app.services.webhook_channel import WebhookChannelService
 from app.services.event_schema import EventSchemaService
@@ -41,45 +41,27 @@ from app.services.api_auth_store import ApiAuthStoreService
 from app.services.event_archive import EventArchiveService
 from app.services.integration_monitor import IntegrationMonitorService
 
+_SERVICE_MODULES = (
+    "api_endpoint", "webhook_channel", "event_schema", "mq_consumer",
+    "dlq_handler", "data_lake_sink", "data_transform", "data_quality_rule",
+    "dispatch_rule", "dedup_filter", "batch_ingest", "incre_cursor",
+    "backfill_job", "call_trace_log", "rate_limit_config", "api_auth_store",
+    "event_archive", "integration_monitor",
+)
+
 
 @pytest.fixture(autouse=True)
-def _seed_and_cleanup():
-    """每个测试前清空存储，确保隔离。"""
+def _seed_and_cleanup(monkeypatch):
+    """每个测试切换到独立临时仓库，确保隔离；monkeypatch 自动还原，避免跨文件污染。"""
+    import sys
     with tempfile.TemporaryDirectory() as tmp:
         store = JsonStore(base_dir=tmp)
-        import app.persistence
-        app.persistence.json_store = store
-
-        import app.services.api_endpoint as api_mod
-        import app.services.webhook_channel as wh_mod
-        import app.services.event_schema as es_mod
-        import app.services.mq_consumer as mq_mod
-        import app.services.dlq_handler as dlq_mod
-        import app.services.data_lake_sink as sink_mod
-        import app.services.data_transform as dt_mod
-        import app.services.data_quality_rule as dq_mod
-        import app.services.dispatch_rule as dr_mod
-        import app.services.dedup_filter as df_mod
-        import app.services.batch_ingest as bi_mod
-        import app.services.incre_cursor as ic_mod
-        import app.services.backfill_job as bj_mod
-        import app.services.call_trace_log as ctl_mod
-        import app.services.rate_limit_config as rlc_mod
-        import app.services.api_auth_store as aas_mod
-        import app.services.event_archive as ea_mod
-        import app.services.integration_monitor as im_mod
-
-        # Re-import all services to pick up new store
-        import importlib
-        for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
-                     dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
-                     rlc_mod, aas_mod, ea_mod, im_mod]:
-            importlib.reload(mod)
-
+        monkeypatch.setattr("app.persistence.json_store", store)
+        for module_name in _SERVICE_MODULES:
+            monkeypatch.setattr(f"app.services.{module_name}.json_store", store, raising=False)
+        # 测试函数体内的 json_store 全局引用指向临时仓库
+        monkeypatch.setattr(sys.modules[__name__], "json_store", store, raising=False)
         yield
-
-        import app.persistence
-        app.persistence.json_store = global_store
 
 
 # ──────────────────────────────────────────────────────────
@@ -250,8 +232,11 @@ def test_chain_3_dlq_to_replay():
     mq_id = json_store.get_all("mq_consumer")[0]["id"]
     mq_svc.run_action(mq_id, "启动消费")
 
-    # 消费一批消息（会触发部分死信）
-    result = mq_svc.consume_batch(mq_id, max_messages=10)
+    # 消费消息（处理结果随机，持续消费直到有失败消息进入死信）
+    for _ in range(20):
+        mq_svc.consume_batch(mq_id, max_messages=10)
+        if dlq_svc.get_dlq_stats()["total_dlq"] > 0:
+            break
 
     # 检查死信统计
     dlq_stats = dlq_svc.get_dlq_stats()
